@@ -1,22 +1,31 @@
-
-name: Deploy Application
+name: Calculator Infrastructure and Deployment
 
 on:
-  workflow_dispatch:
   push:
     branches:
       - main
     paths:
-      - 'Dockerfile'
-      - 'index.html'
+      - 'main.tf'
+      - '*.tf'
+      - '**/*.tf'
+      - '.github/workflows/deploy.yml'
+
+  workflow_dispatch:
 
 permissions:
   contents: read
 
+concurrency:
+  group: calculator-deployment
+  cancel-in-progress: false
+
 jobs:
   deploy:
-    name: Deploy Docker Application
+    name: Create Infrastructure and Deploy Calculator
     runs-on: ubuntu-latest
+
+    env:
+      TF_TOKEN_app_terraform_io: ${{ secrets.TF_API_TOKEN }}
 
     steps:
       - name: Checkout Repository
@@ -29,56 +38,132 @@ jobs:
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-region: us-east-1
 
-      - name: Find Running EC2
-        id: ec2
-        run: |
-          IP=$(aws ec2 describe-instances \
-            --filters \
-              "Name=tag:Name,Values=myserver" \
-              "Name=instance-state-name,Values=running" \
-            --query 'Reservations[].Instances[].PublicIpAddress' \
-            --output text)
+      - name: Verify AWS Identity
+        run: aws sts get-caller-identity
 
-          if [ -z "$IP" ] || [ "$IP" = "None" ]; then
-            echo "No running EC2 instance found."
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.10.5"
+
+      - name: Terraform Format
+        run: terraform fmt -check -recursive
+
+      - name: Terraform Init
+        run: terraform init -input=false
+
+      - name: Terraform Validate
+        run: terraform validate
+
+      - name: Terraform Plan
+        run: terraform plan -input=false -out=tfplan
+
+      - name: Terraform Apply
+        run: terraform apply -input=false -auto-approve tfplan
+
+      - name: Get EC2 Details
+        id: ec2
+        shell: bash
+        run: |
+          INSTANCE_ID=$(terraform output -raw instance_id)
+          PUBLIC_IP=$(terraform output -raw public_ip)
+
+          echo "instance_id=$INSTANCE_ID" >> "$GITHUB_OUTPUT"
+          echo "public_ip=$PUBLIC_IP" >> "$GITHUB_OUTPUT"
+
+      - name: Wait for SSM Agent
+        env:
+          INSTANCE_ID: ${{ steps.ec2.outputs.instance_id }}
+        shell: bash
+        run: |
+          for attempt in $(seq 1 72); do
+            STATUS=$(aws ssm describe-instance-information \
+              --filters "Key=InstanceIds,Values=$INSTANCE_ID" \
+              --query "InstanceInformationList[0].PingStatus" \
+              --output text 2>/dev/null || true)
+
+            if [ "$STATUS" = "Online" ]; then
+              echo "SSM Agent is online."
+              exit 0
+            fi
+
+            echo "Waiting for SSM Agent..."
+            sleep 10
+          done
+
+          echo "SSM Agent did not become online."
+          exit 1
+
+      - name: Deploy Calculator Docker Image
+        env:
+          INSTANCE_ID: ${{ steps.ec2.outputs.instance_id }}
+          DOCKERHUB_IMAGE: ${{ secrets.DOCKERHUB_IMAGE }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [ -z "$DOCKERHUB_IMAGE" ]; then
+            echo "DOCKERHUB_IMAGE secret is missing."
             exit 1
           fi
 
-          echo "host=$IP" >> "$GITHUB_OUTPUT"
+          PARAMETERS=$(jq -n --arg image "$DOCKERHUB_IMAGE" '{
+            commands: [
+              "set -e",
+              "for i in $(seq 1 60); do command -v docker >/dev/null 2>&1 && break; sleep 5; done",
+              "command -v docker >/dev/null 2>&1 || { echo Docker-not-installed; exit 1; }",
+              "systemctl enable --now docker",
+              "docker pull " + $image,
+              "docker rm -f calculator || true",
+              "docker run -d --name calculator --restart unless-stopped -p 80:80 " + $image,
+              "docker ps --filter name=calculator"
+            ]
+          }')
 
-      - name: Copy Application Files
-        uses: appleboy/scp-action@v1
-        with:
-          host: ${{ steps.ec2.outputs.host }}
-          username: ec2-user
-          key: ${{ secrets.EC2_SSH_PRIVATE_KEY }}
-          source: "Dockerfile,index.html"
-          target: "/home/ec2-user/app"
+          COMMAND_ID=$(aws ssm send-command \
+            --instance-ids "$INSTANCE_ID" \
+            --document-name "AWS-RunShellScript" \
+            --comment "Deploy Calculator Docker Image" \
+            --parameters "$PARAMETERS" \
+            --query "Command.CommandId" \
+            --output text)
 
-      - name: Build and Run Docker Container
-        uses: appleboy/ssh-action@v1
-        with:
-          host: ${{ steps.ec2.outputs.host }}
-          username: ec2-user
-          key: ${{ secrets.EC2_SSH_PRIVATE_KEY }}
-          script: |
-            set -e
+          echo "Deployment command submitted."
 
-            if ! command -v docker >/dev/null 2>&1; then
-              sudo dnf install -y docker
-              sudo systemctl enable --now docker
+          for attempt in $(seq 1 60); do
+            STATUS=$(aws ssm get-command-invocation \
+              --command-id "$COMMAND_ID" \
+              --instance-id "$INSTANCE_ID" \
+              --query "Status" \
+              --output text 2>/dev/null || true)
+
+            if [ "$STATUS" = "Success" ]; then
+              echo "Docker deployment succeeded."
+              aws ssm get-command-invocation \
+                --command-id "$COMMAND_ID" \
+                --instance-id "$INSTANCE_ID" \
+                --query "StandardOutputContent" \
+                --output text
+              exit 0
             fi
 
-            cd /home/ec2-user/app
+            if [[ "$STATUS" =~ ^(Failed|TimedOut|Cancelled)$ ]]; then
+              aws ssm get-command-invocation \
+                --command-id "$COMMAND_ID" \
+                --instance-id "$INSTANCE_ID" \
+                --query "StandardErrorContent" \
+                --output text || true
+              exit 1
+            fi
 
-            sudo docker build -t cloud-devops-dashboard .
+            sleep 5
+          done
 
-            sudo docker rm -f cloud-devops-dashboard || true
+          echo "Deployment timed out."
+          exit 1
 
-            sudo docker run -d \
-              --name cloud-devops-dashboard \
-              --restart unless-stopped \
-              -p 80:80 \
-              cloud-devops-dashboard
-
-            sudo docker ps
+      - name: Show Website URL
+        env:
+          PUBLIC_IP: ${{ steps.ec2.outputs.public_ip }}
+        run: |
+          echo "Calculator Website: http://$PUBLIC_IP"
