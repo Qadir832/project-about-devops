@@ -25,6 +25,19 @@ jobs:
     steps:
       - name: Checkout Repository
         uses: actions/checkout@v4
+        with:
+          # Yeh line ensure karti hai ke files root mein aayein
+          path: . 
+
+      # Debug Step: Yeh check karega ke files wahan hain ya nahi
+      - name: Debug - Check Files
+        run: |
+          echo "Current Directory:"
+          pwd
+          echo "Files in Root:"
+          ls -la
+          echo "Files in Terraform Folder:"
+          ls -la Terraform/
 
       - name: Configure AWS Credentials
         uses: aws-actions/configure-aws-credentials@v4
@@ -32,19 +45,6 @@ jobs:
           aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-region: us-east-1
-
-      - name: Verify AWS Identity
-        run: aws sts get-caller-identity
-
-      # YEH DEBUG STEP HAI - Isko check karein logs mein
-      - name: Debug - Check files in Terraform directory
-        run: |
-          echo "Current Directory:"
-          pwd
-          echo "Files in current directory:"
-          ls -la
-          echo "Files in Terraform folder (if inside it):"
-          ls -la Terraform/ || echo "Terraform folder not found here"
 
       - name: Setup Terraform
         uses: hashicorp/setup-terraform@v3
