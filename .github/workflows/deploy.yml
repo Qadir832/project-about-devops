@@ -1,0 +1,84 @@
+
+name: Deploy Application
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+    paths:
+      - 'Dockerfile'
+      - 'index.html'
+
+permissions:
+  contents: read
+
+jobs:
+  deploy:
+    name: Deploy Docker Application
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: us-east-1
+
+      - name: Find Running EC2
+        id: ec2
+        run: |
+          IP=$(aws ec2 describe-instances \
+            --filters \
+              "Name=tag:Name,Values=myserver" \
+              "Name=instance-state-name,Values=running" \
+            --query 'Reservations[].Instances[].PublicIpAddress' \
+            --output text)
+
+          if [ -z "$IP" ] || [ "$IP" = "None" ]; then
+            echo "No running EC2 instance found."
+            exit 1
+          fi
+
+          echo "host=$IP" >> "$GITHUB_OUTPUT"
+
+      - name: Copy Application Files
+        uses: appleboy/scp-action@v1
+        with:
+          host: ${{ steps.ec2.outputs.host }}
+          username: ec2-user
+          key: ${{ secrets.EC2_SSH_PRIVATE_KEY }}
+          source: "Dockerfile,index.html"
+          target: "/home/ec2-user/app"
+
+      - name: Build and Run Docker Container
+        uses: appleboy/ssh-action@v1
+        with:
+          host: ${{ steps.ec2.outputs.host }}
+          username: ec2-user
+          key: ${{ secrets.EC2_SSH_PRIVATE_KEY }}
+          script: |
+            set -e
+
+            if ! command -v docker >/dev/null 2>&1; then
+              sudo dnf install -y docker
+              sudo systemctl enable --now docker
+            fi
+
+            cd /home/ec2-user/app
+
+            sudo docker build -t cloud-devops-dashboard .
+
+            sudo docker rm -f cloud-devops-dashboard || true
+
+            sudo docker run -d \
+              --name cloud-devops-dashboard \
+              --restart unless-stopped \
+              -p 80:80 \
+              cloud-devops-dashboard
+
+            sudo docker ps

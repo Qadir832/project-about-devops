@@ -1,0 +1,66 @@
+name: Provision AWS Infrastructure
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - "Terraform/**"
+      - ".github/workflows/terraform.yml"
+
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  terraform:
+    name: Terraform Infrastructure
+    runs-on: ubuntu-latest
+
+    defaults:
+      run:
+        working-directory: Terraform
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: us-east-1
+
+      - name: Verify AWS Identity
+        run: aws sts get-caller-identity
+
+      # YEH DEBUG STEP HAI - Isko check karein logs mein
+      - name: Debug - Check files in Terraform directory
+        run: |
+          echo "Current Directory:"
+          pwd
+          echo "Files in current directory:"
+          ls -la
+          echo "Files in Terraform folder (if inside it):"
+          ls -la Terraform/ || echo "Terraform folder not found here"
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+
+      - name: Terraform Format Check
+        run: terraform fmt -check -recursive
+
+      - name: Terraform Init
+        run: terraform init
+
+      - name: Terraform Validate
+        run: terraform validate
+
+      - name: Terraform Plan
+        run: terraform plan -out=tfplan
+
+      - name: Terraform Apply
+        if: github.event_name == 'workflow_dispatch' || github.ref == 'refs/heads/main'
+        run: terraform apply -auto-approve tfplan
